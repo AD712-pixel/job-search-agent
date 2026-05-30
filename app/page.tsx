@@ -6,13 +6,20 @@ import CompanyConfig from "@/components/CompanyConfig";
 import RunButton from "@/components/RunButton";
 import StreamLog, { type LogEntry } from "@/components/StreamLog";
 import ResultCard from "@/components/ResultCard";
-import NotionBanner from "@/components/NotionBanner";
 
 const DEFAULT_COMPANIES: Company[] = [
   { id: "1", name: "Salesforce", domain: "salesforce.com" },
   { id: "2", name: "Microsoft", domain: "microsoft.com" },
   { id: "3", name: "Adobe", domain: "adobe.com" },
   { id: "4", name: "Intuit", domain: "intuit.com" },
+];
+
+const DEFAULT_KEYWORDS = [
+  "Product Manager",
+  "GTM Manager",
+  "Pre-Sales",
+  "Partnerships Manager",
+  "Growth Manager",
 ];
 
 function toLogEntry(event: AgentSSEEvent): LogEntry | null {
@@ -30,6 +37,13 @@ function toLogEntry(event: AgentSSEEvent): LogEntry | null {
         company: event.company,
         message: `Found ${event.count} relevant role${event.count !== 1 ? "s" : ""}`,
       };
+    case "agent:roles_capped":
+      return {
+        id,
+        level: "warn",
+        company: event.company,
+        message: `Found ${event.total} roles — scoring top ${event.scoring} by title relevance`,
+      };
     case "agent:enriching":
       return { id, level: "info", company: event.company, message: `Enriching JD: ${event.role_title}` };
     case "agent:scoring":
@@ -41,27 +55,6 @@ function toLogEntry(event: AgentSSEEvent): LogEntry | null {
         company: event.company,
         message: `— ${event.role_title}: S:${event.score.skills_match} Sen:${event.score.seniority_fit} C:${event.score.context_overlap} Overall:${event.score.overall}/10 — ${event.score.rationale} → ${event.skipped ? "SKIPPED" : "QUALIFYING"}`,
       };
-    case "agent:drafting":
-      return { id, level: "info", company: event.company, message: `Drafting outreach: ${event.role_title}` };
-    case "agent:evaluating":
-      return {
-        id,
-        level: "info",
-        company: event.company,
-        message: `Evaluating draft (iter ${event.iteration}): ${event.role_title}`,
-      };
-    case "agent:eval_result":
-      return {
-        id,
-        level: event.eval_tag === "passed" ? "success" : "warn",
-        company: event.company,
-        message:
-          event.eval_tag === "passed"
-            ? `Draft passed eval: ${event.role_title}`
-            : `Draft rewritten: ${event.role_title}`,
-      };
-    case "agent:notion_log":
-      return { id, level: "success", company: event.company, message: `Logged to Notion: ${event.role_title}` };
     case "agent:done":
       return { id, level: "success", company: event.company, message: "Done." };
     case "agent:debug":
@@ -73,12 +66,32 @@ function toLogEntry(event: AgentSSEEvent): LogEntry | null {
 
 export default function HomePage() {
   const [companies, setCompanies] = useState<Company[]>(DEFAULT_COMPANIES);
+  const [keywords, setKeywords] = useState<string[]>(DEFAULT_KEYWORDS);
+  const [keywordInput, setKeywordInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [qualifyingRoles, setQualifyingRoles] = useState<QualifyingRole[]>([]);
-  const [showNotionBanner, setShowNotionBanner] = useState(false);
   const [hasRun, setHasRun] = useState(false);
   const esRef = useRef<EventSource | null>(null);
+
+  const addKeyword = (raw: string) => {
+    const trimmed = raw.trim();
+    if (trimmed && !keywords.includes(trimmed)) {
+      setKeywords((prev) => [...prev, trimmed]);
+    }
+    setKeywordInput("");
+  };
+
+  const removeKeyword = (kw: string) => {
+    setKeywords((prev) => prev.filter((k) => k !== kw));
+  };
+
+  const handleKeywordKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter" || e.key === ",") {
+      e.preventDefault();
+      addKeyword(keywordInput);
+    }
+  };
 
   const startRun = useCallback(() => {
     if (isRunning) return;
@@ -86,11 +99,11 @@ export default function HomePage() {
     setIsRunning(true);
     setLogEntries([]);
     setQualifyingRoles([]);
-    setShowNotionBanner(false);
     setHasRun(true);
 
     const params = new URLSearchParams({
       companies: JSON.stringify(companies),
+      keywords: JSON.stringify(keywords),
     });
 
     const es = new EventSource(`/api/agent?${params.toString()}`);
@@ -101,7 +114,6 @@ export default function HomePage() {
 
       if (event.type === "run:complete") {
         setQualifyingRoles(event.qualifying_roles);
-        setShowNotionBanner(event.qualifying_roles.length > 0);
         setIsRunning(false);
         es.close();
         return;
@@ -133,7 +145,7 @@ export default function HomePage() {
       ]);
       es.close();
     };
-  }, [isRunning, companies]);
+  }, [isRunning, companies, keywords]);
 
   const stopRun = () => {
     esRef.current?.close();
@@ -171,6 +183,43 @@ export default function HomePage() {
 
           {/* ── Left panel: config + controls ── */}
           <div className="lg:col-span-1 space-y-5">
+
+            {/* Keywords config */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                Search keywords
+              </h3>
+              <div className="flex flex-wrap gap-1.5">
+                {keywords.map((kw) => (
+                  <span
+                    key={kw}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 bg-slate-800 border border-slate-700 rounded text-xs text-slate-300"
+                  >
+                    {kw}
+                    {!isRunning && (
+                      <button
+                        onClick={() => removeKeyword(kw)}
+                        className="text-slate-500 hover:text-slate-300 transition-colors leading-none"
+                        aria-label={`Remove ${kw}`}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              {!isRunning && (
+                <input
+                  type="text"
+                  value={keywordInput}
+                  onChange={(e) => setKeywordInput(e.target.value)}
+                  onKeyDown={handleKeywordKeyDown}
+                  onBlur={() => keywordInput.trim() && addKeyword(keywordInput)}
+                  placeholder="Add keyword, press Enter"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 placeholder-slate-600 focus:outline-none focus:border-slate-500"
+                />
+              )}
+            </div>
 
             {/* Company config */}
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
@@ -263,18 +312,12 @@ export default function HomePage() {
             {/* Empty state after a completed run */}
             {hasRun && !isRunning && qualifyingRoles.length === 0 && logEntries.length > 0 && (
               <div className="text-center py-12 text-slate-600 text-sm">
-                No qualifying roles found — all roles scored below 6/10.
+                No qualifying roles found — all roles scored below 5/10.
               </div>
             )}
           </div>
         </div>
       </main>
-
-      <NotionBanner
-        show={showNotionBanner}
-        roleCount={qualifyingRoles.length}
-        onDismiss={() => setShowNotionBanner(false)}
-      />
     </div>
   );
 }

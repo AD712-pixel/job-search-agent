@@ -14,7 +14,7 @@ Use the score_role tool to return a structured score. A score of 6 means a reaso
 - overall (1-10): Holistic fit — weight skills_match and seniority_fit most heavily, context_overlap least heavily
 
 Location rule (hard filter, not soft penalty):
-- If the role is US-only with no remote option, set seniority_fit to a maximum of 4 regardless of all other fit factors.
+- If the role is explicitly US-only with no remote option and no India office listed, set seniority_fit to a maximum of 3 and overall to a maximum of 4. This is a hard location filter.
 - If the role is India-based or remote-friendly, do not penalize for location at all.`;
 }
 
