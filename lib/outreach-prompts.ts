@@ -21,7 +21,7 @@ export function buildPersonaDraftSystemPrompt(persona: Persona): string {
 - Lead with something specific about the company or their recent work
 - Use the ask without asking approach — open a conversation, do not ask for a job
 - Frame as seeking advice or perspective
-- Maximum 300 characters total. Count carefully. This is a LinkedIn connection request note, not a message — it must be extremely concise.
+- This is a LinkedIn connection request note. LinkedIn enforces a hard 300 character limit in the UI. You must stay strictly under 300 characters — count carefully. One sentence insight + one closing question. Nothing else.
 - Never say: I came across your opening, I'd love to connect, Do you have any openings, just checking in
 - End with a low-friction question about their experience or perspective
 - If the user provided a specific hook, use it as the opening anchor

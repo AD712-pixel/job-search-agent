@@ -1,95 +1,61 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
-import type { Company, QualifyingRole, AgentSSEEvent } from "@/lib/types";
-import CompanyConfig from "@/components/CompanyConfig";
+import type { QualifyingRole, AgentSSEEvent } from "@/lib/types";
 import RunButton from "@/components/RunButton";
 import StreamLog, { type LogEntry } from "@/components/StreamLog";
 import ResultCard from "@/components/ResultCard";
-
-const DEFAULT_COMPANIES: Company[] = [
-  { id: "1", name: "Salesforce", domain: "salesforce.com" },
-  { id: "2", name: "Microsoft", domain: "microsoft.com" },
-  { id: "3", name: "Adobe", domain: "adobe.com" },
-  { id: "4", name: "Intuit", domain: "intuit.com" },
-];
-
-const DEFAULT_KEYWORDS = [
-  "Product Manager",
-  "GTM Manager",
-  "Pre-Sales",
-  "Partnerships Manager",
-  "Growth Manager",
-];
 
 function toLogEntry(event: AgentSSEEvent): LogEntry | null {
   const id = crypto.randomUUID();
 
   switch (event.type) {
-    case "agent:start":
-      return { id, level: "info", company: event.company, message: "Starting search..." };
-    case "agent:search":
-      return { id, level: "info", company: event.company, message: `Searching: "${event.query}"` };
-    case "agent:roles_found":
-      return {
-        id,
-        level: event.count > 0 ? "success" : "skip",
-        company: event.company,
-        message: `Found ${event.count} relevant role${event.count !== 1 ? "s" : ""}`,
-      };
-    case "agent:roles_capped":
-      return {
-        id,
-        level: "warn",
-        company: event.company,
-        message: `Found ${event.total} roles — scoring top ${event.scoring} by title relevance`,
-      };
-    case "agent:enriching":
-      return { id, level: "info", company: event.company, message: `Enriching JD: ${event.role_title}` };
     case "agent:scoring":
-      return { id, level: "info", company: event.company, message: `Scoring: ${event.role_title}` };
+      return {
+        id,
+        level: "info",
+        company: event.company,
+        message: `Scoring: ${event.role_title}`,
+      };
     case "agent:score_result":
       return {
         id,
         level: event.skipped ? "skip" : "success",
         company: event.company,
-        message: `— ${event.role_title}: S:${event.score.skills_match} Sen:${event.score.seniority_fit} C:${event.score.context_overlap} Overall:${event.score.overall}/10 — ${event.score.rationale} → ${event.skipped ? "SKIPPED" : "QUALIFYING"}`,
+        message: `${event.role_title}: S:${event.score.skills_match} Sen:${event.score.seniority_fit} C:${event.score.context_overlap} Overall:${event.score.overall}/10 — ${event.score.rationale} → ${event.skipped ? "SKIPPED" : "QUALIFYING"}`,
       };
-    case "agent:done":
-      return { id, level: "success", company: event.company, message: "Done." };
-    case "agent:debug":
-      return { id, level: "info", company: event.company, message: event.message };
     default:
       return null;
   }
 }
 
 export default function HomePage() {
-  const [companies, setCompanies] = useState<Company[]>(DEFAULT_COMPANIES);
-  const [keywords, setKeywords] = useState<string[]>(DEFAULT_KEYWORDS);
-  const [keywordInput, setKeywordInput] = useState("");
+  const [manualUrls, setManualUrls] = useState<string[]>([]);
+  const [urlInput, setUrlInput] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [qualifyingRoles, setQualifyingRoles] = useState<QualifyingRole[]>([]);
   const [hasRun, setHasRun] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
-  const addKeyword = (raw: string) => {
+  const addUrl = (raw: string) => {
     const trimmed = raw.trim();
-    if (trimmed && !keywords.includes(trimmed)) {
-      setKeywords((prev) => [...prev, trimmed]);
+    if (trimmed && trimmed.startsWith("http") && !manualUrls.includes(trimmed)) {
+      setManualUrls((prev) => [...prev, trimmed]);
     }
-    setKeywordInput("");
+    setUrlInput("");
   };
 
-  const removeKeyword = (kw: string) => {
-    setKeywords((prev) => prev.filter((k) => k !== kw));
-  };
+  const removeUrl = (u: string) =>
+    setManualUrls((prev) => prev.filter((x) => x !== u));
 
-  const handleKeywordKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" || e.key === ",") {
-      e.preventDefault();
-      addKeyword(keywordInput);
+  const urlLabel = (raw: string) => {
+    try {
+      const { hostname, pathname } = new URL(raw);
+      const path = pathname.length > 22 ? pathname.slice(0, 22) + "…" : pathname;
+      return `${hostname}${path}`;
+    } catch {
+      return raw.slice(0, 40);
     }
   };
 
@@ -102,8 +68,7 @@ export default function HomePage() {
     setHasRun(true);
 
     const params = new URLSearchParams({
-      companies: JSON.stringify(companies),
-      keywords: JSON.stringify(keywords),
+      manualUrls: JSON.stringify(manualUrls),
     });
 
     const es = new EventSource(`/api/agent?${params.toString()}`);
@@ -122,7 +87,11 @@ export default function HomePage() {
       if (event.type === "run:error") {
         setLogEntries((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), level: "warn" as const, message: `Error: ${event.message}` },
+          {
+            id: crypto.randomUUID(),
+            level: "warn" as const,
+            message: `Error: ${event.message}`,
+          },
         ]);
         setIsRunning(false);
         es.close();
@@ -145,18 +114,20 @@ export default function HomePage() {
       ]);
       es.close();
     };
-  }, [isRunning, companies, keywords]);
+  }, [isRunning, manualUrls]);
 
   const stopRun = () => {
     esRef.current?.close();
     setIsRunning(false);
     setLogEntries((prev) => [
       ...prev,
-      { id: crypto.randomUUID(), level: "warn" as const, message: "Run stopped by user." },
+      {
+        id: crypto.randomUUID(),
+        level: "warn" as const,
+        message: "Run stopped by user.",
+      },
     ]);
   };
-
-  const validCompanies = companies.filter((c) => c.name.trim() && c.domain.trim());
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
@@ -166,7 +137,7 @@ export default function HomePage() {
           <div>
             <h1 className="text-lg font-bold tracking-tight">Job Search Agent</h1>
             <p className="text-xs text-slate-500 mt-0.5">
-              Amey Divekar · Director, CreditNirvana · IIM Bangalore MBA · Bengaluru
+              Paste job URLs to score fit and draft persona-based outreach
             </p>
           </div>
           {isRunning && (
@@ -181,53 +152,61 @@ export default function HomePage() {
       <main className="max-w-7xl mx-auto px-6 py-8">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
 
-          {/* ── Left panel: config + controls ── */}
+          {/* ── Left panel ── */}
           <div className="lg:col-span-1 space-y-5">
 
-            {/* Keywords config */}
+            {/* Job URLs input */}
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Search keywords
+                Job URLs
               </h3>
-              <div className="flex flex-wrap gap-1.5">
-                {keywords.map((kw) => (
-                  <span
-                    key={kw}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 bg-slate-800 border border-slate-700 rounded text-xs text-slate-300"
-                  >
-                    {kw}
-                    {!isRunning && (
-                      <button
-                        onClick={() => removeKeyword(kw)}
-                        className="text-slate-500 hover:text-slate-300 transition-colors leading-none"
-                        aria-label={`Remove ${kw}`}
-                      >
-                        ×
-                      </button>
-                    )}
-                  </span>
-                ))}
-              </div>
-              {!isRunning && (
-                <input
-                  type="text"
-                  value={keywordInput}
-                  onChange={(e) => setKeywordInput(e.target.value)}
-                  onKeyDown={handleKeywordKeyDown}
-                  onBlur={() => keywordInput.trim() && addKeyword(keywordInput)}
-                  placeholder="Add keyword, press Enter"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 placeholder-slate-600 focus:outline-none focus:border-slate-500"
-                />
-              )}
-            </div>
 
-            {/* Company config */}
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-              <CompanyConfig
-                companies={companies}
-                onChange={setCompanies}
-                disabled={isRunning}
-              />
+              {manualUrls.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  {manualUrls.map((u) => (
+                    <span
+                      key={u}
+                      className="inline-flex items-center justify-between gap-2 px-2 py-1 bg-slate-800 border border-slate-700 rounded text-xs text-slate-300"
+                    >
+                      <span className="truncate min-w-0">{urlLabel(u)}</span>
+                      {!isRunning && (
+                        <button
+                          onClick={() => removeUrl(u)}
+                          className="shrink-0 text-slate-500 hover:text-slate-300 transition-colors leading-none"
+                          aria-label="Remove URL"
+                        >
+                          ×
+                        </button>
+                      )}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {!isRunning && (
+                <div className="flex gap-2">
+                  <input
+                    type="url"
+                    value={urlInput}
+                    onChange={(e) => setUrlInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        addUrl(urlInput);
+                      }
+                    }}
+                    placeholder="Paste a job posting URL, press Enter"
+                    className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-300 placeholder-slate-600 focus:outline-none focus:border-slate-500"
+                  />
+                  <button
+                    onClick={() => addUrl(urlInput)}
+                    disabled={!urlInput.trim().startsWith("http")}
+                    className="shrink-0 text-xs px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 disabled:opacity-40 transition-colors"
+                  >
+                    Add
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Run button */}
@@ -235,7 +214,7 @@ export default function HomePage() {
               <RunButton
                 onClick={startRun}
                 isRunning={isRunning}
-                disabled={validCompanies.length === 0}
+                disabled={manualUrls.length === 0}
               />
               {isRunning && (
                 <button
@@ -247,7 +226,7 @@ export default function HomePage() {
               )}
             </div>
 
-            {/* Candidate profile card */}
+            {/* Candidate profile */}
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
                 Candidate Profile
@@ -276,28 +255,32 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* ── Right panel: log + results ── */}
+          {/* ── Right panel ── */}
           <div className="lg:col-span-2 space-y-8">
 
+            {/* Pre-run hint */}
+            {!hasRun && !isRunning && (
+              <div className="text-center py-16 text-slate-600 text-sm">
+                Paste at least one job URL above to get started
+              </div>
+            )}
+
             {/* Agent log */}
-            <div className="space-y-2">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Agent Log
-              </h2>
-              <StreamLog entries={logEntries} isRunning={isRunning} />
-            </div>
+            {(hasRun || isRunning) && (
+              <div className="space-y-2">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  Agent Log
+                </h2>
+                <StreamLog entries={logEntries} isRunning={isRunning} />
+              </div>
+            )}
 
             {/* Results */}
             {qualifyingRoles.length > 0 && (
               <div className="space-y-4">
-                <div className="flex items-center gap-2">
-                  <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Qualifying Roles
-                  </h2>
-                  <span className="text-xs px-1.5 py-0.5 bg-slate-800 border border-slate-700 rounded text-slate-400">
-                    {qualifyingRoles.length}
-                  </span>
-                </div>
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  Fit Assessment
+                </h2>
                 <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                   {qualifyingRoles.map((role, i) => (
                     <ResultCard
@@ -309,7 +292,7 @@ export default function HomePage() {
               </div>
             )}
 
-            {/* Empty state after a completed run */}
+            {/* Empty state */}
             {hasRun && !isRunning && qualifyingRoles.length === 0 && logEntries.length > 0 && (
               <div className="text-center py-12 text-slate-600 text-sm">
                 No qualifying roles found — all roles scored below 5/10.

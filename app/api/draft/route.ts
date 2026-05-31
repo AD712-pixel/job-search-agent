@@ -59,11 +59,13 @@ async function evaluateDraft(
   draft: string,
   persona: Persona
 ): Promise<{ verdict: "pass" | "fail"; reason: string }> {
-  // Hard character count check — do not rely on LLM to count accurately
+  console.log("[evaluateDraft] persona=", persona, "draft.length=", draft.length);
+
+  // Hard character count check for cold only — LLMs cannot count characters accurately
   if (persona === "cold" && draft.length > 300) {
     return {
       verdict: "fail",
-      reason: `Draft is ${draft.length} characters — must be under 300. Rewrite in under 300 characters. Keep only the hook and the closing question.`,
+      reason: `Draft is ${draft.length} characters — must be under 300 for a LinkedIn connection request note. Rewrite in under 300 characters. One sentence hook + one closing question. Cut everything else.`,
     };
   }
 
