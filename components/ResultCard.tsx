@@ -5,6 +5,7 @@ import type { QualifyingRole, RoleScore } from "@/lib/types";
 
 interface Props {
   role: QualifyingRole;
+  profile: string;
 }
 
 type Persona = "cold" | "warm" | "hot";
@@ -30,10 +31,10 @@ function ScorePill({ label, value }: { label: string; value: number }) {
 const PERSONA_PLACEHOLDERS: Record<Persona, string> = {
   cold: "Any specific hook? (optional — e.g. saw their AI post, admire their payments product)",
   warm: "How do you know this person? (e.g. met at SaaStr, commented on their post)",
-  hot: "What's your relationship? (e.g. ex-ICICI colleague, IIM batchmate)",
+  hot: "What's your relationship? (e.g. ex-colleague, former manager, classmate)",
 };
 
-export default function ResultCard({ role }: Props) {
+export default function ResultCard({ role, profile }: Props) {
   const [persona, setPersona] = useState<Persona | null>(null);
   const [context, setContext] = useState("");
   const [draft, setDraft] = useState<string | null>(null);
@@ -62,6 +63,7 @@ export default function ResultCard({ role }: Props) {
           score: role.score,
           persona,
           context,
+          profile,
         }),
       });
       const data = await res.json();

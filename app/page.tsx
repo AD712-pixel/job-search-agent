@@ -1,12 +1,21 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import type { Company, QualifyingRole, AgentSSEEvent } from "@/lib/types";
+import type { UserProfile } from "@/lib/candidate-profile";
+import { buildProfileString } from "@/lib/candidate-profile";
 import CompanyConfig from "@/components/CompanyConfig";
 import RunButton from "@/components/RunButton";
 import StreamLog, { type LogEntry } from "@/components/StreamLog";
 import ResultCard from "@/components/ResultCard";
+import ProfileForm from "@/components/ProfileForm";
 
+// ── localStorage keys ──────────────────────────────────────────────────────────
+const LS_PROFILE = "job-agent-profile";
+const LS_COMPANIES = "job-agent-companies";
+const LS_KEYWORDS = "job-agent-keywords";
+
+// ── Defaults ───────────────────────────────────────────────────────────────────
 const DEFAULT_COMPANIES: Company[] = [
   { id: "1", name: "Salesforce", domain: "salesforce.com" },
   { id: "2", name: "Microsoft", domain: "microsoft.com" },
@@ -22,6 +31,7 @@ const DEFAULT_KEYWORDS = [
   "Growth Manager",
 ];
 
+// ── Log helpers ────────────────────────────────────────────────────────────────
 function toLogEntry(event: AgentSSEEvent): LogEntry | null {
   const id = crypto.randomUUID();
 
@@ -64,16 +74,60 @@ function toLogEntry(event: AgentSSEEvent): LogEntry | null {
   }
 }
 
+// ── Main component ─────────────────────────────────────────────────────────────
 export default function HomePage() {
+  // Hydration: wait until we've read localStorage before rendering
+  const [initialized, setInitialized] = useState(false);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [showEditProfile, setShowEditProfile] = useState(false);
+
   const [companies, setCompanies] = useState<Company[]>(DEFAULT_COMPANIES);
   const [keywords, setKeywords] = useState<string[]>(DEFAULT_KEYWORDS);
   const [keywordInput, setKeywordInput] = useState("");
+
   const [isRunning, setIsRunning] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [qualifyingRoles, setQualifyingRoles] = useState<QualifyingRole[]>([]);
   const [hasRun, setHasRun] = useState(false);
   const esRef = useRef<EventSource | null>(null);
 
+  // ── Load from localStorage on mount ────────────────────────────────────────
+  useEffect(() => {
+    try {
+      const sp = localStorage.getItem(LS_PROFILE);
+      if (sp) setProfile(JSON.parse(sp));
+    } catch {}
+    try {
+      const sc = localStorage.getItem(LS_COMPANIES);
+      if (sc) setCompanies(JSON.parse(sc));
+    } catch {}
+    try {
+      const sk = localStorage.getItem(LS_KEYWORDS);
+      if (sk) setKeywords(JSON.parse(sk));
+    } catch {}
+    setInitialized(true);
+  }, []);
+
+  // ── Persist companies ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!initialized) return;
+    localStorage.setItem(LS_COMPANIES, JSON.stringify(companies));
+  }, [companies, initialized]);
+
+  // ── Persist keywords ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!initialized) return;
+    localStorage.setItem(LS_KEYWORDS, JSON.stringify(keywords));
+  }, [keywords, initialized]);
+
+  // ── Profile save ────────────────────────────────────────────────────────────
+  const handleSaveProfile = (p: UserProfile) => {
+    setProfile(p);
+    setShowEditProfile(false);
+    localStorage.setItem(LS_PROFILE, JSON.stringify(p));
+  };
+
+  // ── Keyword helpers ─────────────────────────────────────────────────────────
   const addKeyword = (raw: string) => {
     const trimmed = raw.trim();
     if (trimmed && !keywords.includes(trimmed)) {
@@ -93,6 +147,9 @@ export default function HomePage() {
     }
   };
 
+  // ── Agent run ───────────────────────────────────────────────────────────────
+  const profileString = profile ? buildProfileString(profile) : "";
+
   const startRun = useCallback(() => {
     if (isRunning) return;
 
@@ -104,6 +161,7 @@ export default function HomePage() {
     const params = new URLSearchParams({
       companies: JSON.stringify(companies),
       keywords: JSON.stringify(keywords),
+      profile: profileString,
     });
 
     const es = new EventSource(`/api/agent?${params.toString()}`);
@@ -137,15 +195,11 @@ export default function HomePage() {
       setIsRunning(false);
       setLogEntries((prev) => [
         ...prev,
-        {
-          id: crypto.randomUUID(),
-          level: "warn" as const,
-          message: "Connection closed.",
-        },
+        { id: crypto.randomUUID(), level: "warn" as const, message: "Connection closed." },
       ]);
       es.close();
     };
-  }, [isRunning, companies, keywords]);
+  }, [isRunning, companies, keywords, profileString]);
 
   const stopRun = () => {
     esRef.current?.close();
@@ -158,6 +212,56 @@ export default function HomePage() {
 
   const validCompanies = companies.filter((c) => c.name.trim() && c.domain.trim());
 
+  // ── Render guard — wait for localStorage ───────────────────────────────────
+  if (!initialized) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <div className="w-4 h-4 bg-slate-600 rounded-full animate-pulse" />
+      </div>
+    );
+  }
+
+  // ── Onboarding screen ──────────────────────────────────────────────────────
+  if (!profile) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-6 py-12">
+        <div className="w-full max-w-lg space-y-8">
+          <div className="space-y-2">
+            <h1 className="text-2xl font-bold tracking-tight">Job Search Agent</h1>
+            <p className="text-sm text-slate-500">
+              Set up your profile to get started.{" "}
+              <span className="text-slate-600">Stored locally on your device — never shared.</span>
+            </p>
+          </div>
+          <ProfileForm onSave={handleSaveProfile} isOnboarding />
+        </div>
+      </div>
+    );
+  }
+
+  // ── Edit profile overlay ───────────────────────────────────────────────────
+  if (showEditProfile) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-6 py-12">
+        <div className="w-full max-w-lg space-y-8">
+          <div className="space-y-2">
+            <h1 className="text-lg font-bold tracking-tight">Edit Profile</h1>
+            <p className="text-xs text-slate-600">Changes apply to future scoring and drafting runs.</p>
+          </div>
+          <ProfileForm
+            initial={profile}
+            onSave={handleSaveProfile}
+            onCancel={() => setShowEditProfile(false)}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // ── Main UI ────────────────────────────────────────────────────────────────
+  const targetRolesDisplay = profile.targetRoles || "—";
+  const domainDisplay = profile.domain || "—";
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
       {/* Header */}
@@ -165,9 +269,6 @@ export default function HomePage() {
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div>
             <h1 className="text-lg font-bold tracking-tight">Job Search Agent</h1>
-            <p className="text-xs text-slate-500 mt-0.5">
-              Amey Divekar · Director, CreditNirvana · IIM Bangalore MBA · Bengaluru
-            </p>
           </div>
           {isRunning && (
             <div className="flex items-center gap-2 text-xs text-blue-400">
@@ -247,32 +348,42 @@ export default function HomePage() {
               )}
             </div>
 
-            {/* Candidate profile card */}
+            {/* Candidate profile panel */}
             <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                Candidate Profile
-              </h3>
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  Candidate Profile
+                </h3>
+                <button
+                  onClick={() => setShowEditProfile(true)}
+                  className="text-xs text-slate-600 hover:text-slate-400 transition-colors"
+                >
+                  Edit
+                </button>
+              </div>
               <div className="space-y-1">
-                <p className="text-sm font-medium text-slate-200">Amey Divekar</p>
-                <p className="text-xs text-slate-500">Director · CreditNirvana (Perfios)</p>
-                <p className="text-xs text-slate-500">MBA · IIM Bangalore</p>
+                <p className="text-sm font-medium text-slate-200">{profile.name}</p>
+                <p className="text-xs text-slate-500">{profile.currentRole}</p>
+                {profile.experience && (
+                  <p className="text-xs text-slate-600">{profile.experience}</p>
+                )}
               </div>
-              <div className="space-y-1.5 pt-1 border-t border-slate-800">
-                <p className="text-xs text-slate-600 font-medium uppercase tracking-wide">
-                  Target roles
-                </p>
-                <p className="text-xs text-slate-400">
-                  Growth PM · Pre-Sales Lead · Partnerships Manager · Product Manager
-                </p>
-              </div>
-              <div className="space-y-1.5 pt-1 border-t border-slate-800">
-                <p className="text-xs text-slate-600 font-medium uppercase tracking-wide">
-                  Domain
-                </p>
-                <p className="text-xs text-slate-400">
-                  BFSI · Lending SaaS · AI agents · B2B fintech · Enterprise
-                </p>
-              </div>
+              {targetRolesDisplay !== "—" && (
+                <div className="space-y-1.5 pt-1 border-t border-slate-800">
+                  <p className="text-xs text-slate-600 font-medium uppercase tracking-wide">
+                    Target roles
+                  </p>
+                  <p className="text-xs text-slate-400">{targetRolesDisplay}</p>
+                </div>
+              )}
+              {domainDisplay !== "—" && (
+                <div className="space-y-1.5 pt-1 border-t border-slate-800">
+                  <p className="text-xs text-slate-600 font-medium uppercase tracking-wide">
+                    Domain
+                  </p>
+                  <p className="text-xs text-slate-400">{domainDisplay}</p>
+                </div>
+              )}
             </div>
           </div>
 
@@ -292,7 +403,7 @@ export default function HomePage() {
               <div className="space-y-4">
                 <div className="flex items-center gap-2">
                   <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Qualifying Roles
+                    Fit Assessment
                   </h2>
                   <span className="text-xs px-1.5 py-0.5 bg-slate-800 border border-slate-700 rounded text-slate-400">
                     {qualifyingRoles.length}
@@ -303,6 +414,7 @@ export default function HomePage() {
                     <ResultCard
                       key={`${role.company}-${role.role_title}-${i}`}
                       role={role}
+                      profile={profileString}
                     />
                   ))}
                 </div>

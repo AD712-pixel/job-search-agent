@@ -27,6 +27,7 @@ interface DraftRequest {
   score: RoleScore;
   persona: Persona;
   context: string;
+  profile: string;
 }
 
 async function generateDraft(
@@ -35,12 +36,13 @@ async function generateDraft(
   jdSummary: string,
   score: RoleScore,
   persona: Persona,
-  context: string
+  context: string,
+  profile: string
 ): Promise<string> {
   const response = await getClient().messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 200,
-    system: buildPersonaDraftSystemPrompt(persona),
+    system: buildPersonaDraftSystemPrompt(persona, profile),
     messages: [
       {
         role: "user",
@@ -90,12 +92,13 @@ async function rewriteDraft(
   company: string,
   jdSummary: string,
   persona: Persona,
-  context: string
+  context: string,
+  profile: string
 ): Promise<string> {
   const response = await getClient().messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 200,
-    system: buildPersonaDraftSystemPrompt(persona),
+    system: buildPersonaDraftSystemPrompt(persona, profile),
     messages: [
       {
         role: "user",
@@ -118,7 +121,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { role, company, jd_summary, score, persona, context } = body;
+  const { role, company, jd_summary, score, persona, context, profile } = body;
 
   if (!role || !company || !persona) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
@@ -126,6 +129,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   const jdSummary = jd_summary ?? "";
   const ctx = context ?? "";
+  const profileStr = profile ?? "";
 
   // Warm persona requires a real prior connection — don't draft without context
   if (persona === "warm" && !ctx.trim()) {
@@ -135,20 +139,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     });
   }
 
-  let draft = await generateDraft(role, company, jdSummary, score, persona, ctx);
+  let draft = await generateDraft(role, company, jdSummary, score, persona, ctx, profileStr);
   const originalDraft = draft;
   let evalTag: EvalTag = "passed";
 
   // Iteration 1 — always pass originalDraft to rewrite, not previous rewrite
   const eval1 = await evaluateDraft(draft, persona);
   if (eval1.verdict === "fail") {
-    draft = await rewriteDraft(originalDraft, eval1.reason, role, company, jdSummary, persona, ctx);
+    draft = await rewriteDraft(originalDraft, eval1.reason, role, company, jdSummary, persona, ctx, profileStr);
     evalTag = "rewritten 1×";
 
     // Iteration 2 — pass originalDraft + latest critique only
     const eval2 = await evaluateDraft(draft, persona);
     if (eval2.verdict === "fail") {
-      draft = await rewriteDraft(originalDraft, eval2.reason, role, company, jdSummary, persona, ctx);
+      draft = await rewriteDraft(originalDraft, eval2.reason, role, company, jdSummary, persona, ctx, profileStr);
       evalTag = "rewritten 2×";
     }
   }

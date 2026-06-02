@@ -250,12 +250,13 @@ Return a detailed summary (not JSON — just descriptive text).`,
 async function scoreRole(
   role: RawRole,
   jdText: string,
-  companyContext: string
+  companyContext: string,
+  profile: string
 ): Promise<RoleScore> {
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 1024,
-    system: buildScoringSystemPrompt(),
+    system: buildScoringSystemPrompt(profile),
     tools: [SCORE_TOOL],
     tool_choice: { type: "tool", name: "score_role" },
     messages: [
@@ -276,6 +277,7 @@ async function scoreRole(
 async function runForCompany(
   company: Company,
   keywords: string[],
+  profile: string,
   emit: (e: AgentSSEEvent) => void
 ): Promise<QualifyingRole[]> {
   emit({ type: "agent:start", company: company.name });
@@ -321,7 +323,7 @@ async function runForCompany(
 
     let score: RoleScore;
     try {
-      score = await scoreRole(role, jdText, "");
+      score = await scoreRole(role, jdText, "", profile);
     } catch (err) {
       console.error(`Scoring failed for ${role.title}:`, err);
       continue;
@@ -361,6 +363,7 @@ export async function GET(request: NextRequest): Promise<Response> {
   const url = new URL(request.url);
   const companiesParam = url.searchParams.get("companies");
   const keywordsParam = url.searchParams.get("keywords");
+  const profile = url.searchParams.get("profile") ?? "";
 
   let companies: Company[];
   try {
@@ -403,7 +406,7 @@ export async function GET(request: NextRequest): Promise<Response> {
 
     try {
       const results = await Promise.all(
-        companies.map((c) => runForCompany(c, keywords, emit))
+        companies.map((c) => runForCompany(c, keywords, profile, emit))
       );
       const allRoles = results.flat();
       emit({ type: "run:complete", qualifying_roles: allRoles });

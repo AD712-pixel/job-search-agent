@@ -5,7 +5,7 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Job Search Agent — Amey Divekar",
+  title: "Job Search Agent",
   description: "AI-powered job search and LinkedIn outreach agent",
 };
 
