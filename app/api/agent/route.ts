@@ -1,20 +1,27 @@
 import { type NextRequest } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { buildScoringSystemPrompt, buildScoringUserPrompt } from "@/lib/scoring-prompts";
-import type { Company, QualifyingRole, RawRole, RoleScore, AgentSSEEvent } from "@/lib/types";
+import { fetchGreenhouseJobs, fetchLeverJobs, fetchAshbyJobs } from "@/lib/ats-clients";
+import { discoverFirecrawlJobs } from "@/lib/firecrawl-client";
+import { filterByFreshness, filterByLocation, filterSeen, triageTitles, keywordRelevanceScore } from "@/lib/job-filters";
+import type {
+  Company,
+  QualifyingRole,
+  NormalizedJob,
+  RoleScore,
+  AgentSSEEvent,
+  FunnelStats,
+} from "@/lib/types";
 
 export const runtime = "nodejs";
-export const maxDuration = 30;
+export const maxDuration = 60;
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-  defaultHeaders: {
-    "anthropic-beta": "web-search-2025-03-05",
-  },
-});
+const COMPANY_TIMEOUT_MS = 45_000;
+const TOP_N_TO_SCORE = 5;
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const WEB_SEARCH_TOOL: any = { type: "web_search_20250305", name: "web_search" };
+function getClient() {
+  return new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+}
 
 const SCORE_TOOL: Anthropic.Tool = {
   name: "score_role",
@@ -49,10 +56,10 @@ const SCORE_TOOL: Anthropic.Tool = {
 };
 
 const DEFAULT_COMPANIES: Company[] = [
-  { id: "1", name: "Salesforce", domain: "salesforce.com" },
-  { id: "2", name: "Microsoft", domain: "microsoft.com" },
-  { id: "3", name: "Adobe", domain: "adobe.com" },
-  { id: "4", name: "Intuit", domain: "intuit.com" },
+  { id: "1", name: "Salesforce", domain: "salesforce.com", source: { type: "firecrawl", careersUrl: "" } },
+  { id: "2", name: "Microsoft", domain: "microsoft.com", source: { type: "firecrawl", careersUrl: "" } },
+  { id: "3", name: "Adobe", domain: "adobe.com", source: { type: "firecrawl", careersUrl: "" } },
+  { id: "4", name: "Intuit", domain: "intuit.com", source: { type: "firecrawl", careersUrl: "" } },
 ];
 
 const DEFAULT_KEYWORDS = [
@@ -63,197 +70,17 @@ const DEFAULT_KEYWORDS = [
   "Growth Manager",
 ];
 
-function extractJsonArray(text: string): RawRole[] {
-  const match = text.match(/\[[\s\S]*\]/);
-  if (!match) return [];
-  try {
-    const parsed = JSON.parse(match[0]);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-
-const AGGREGATOR_TERMS = [
-  "jobs page", "job listings", "careers page",
-  "united states", "nationwide", "worldwide",
-  "company page", "all levels",
-];
-
-function isAggregatorTitle(lowerTitle: string): boolean {
-  return AGGREGATOR_TERMS.some((term) => lowerTitle.includes(term));
-}
-
-function isVagueJD(snippet: string): boolean {
-  const hasKeywords = /responsibilities|requirements|qualifications|experience|skills/i.test(snippet);
-  return snippet.length < 300 || !hasKeywords;
-}
-
-function keywordRelevanceScore(title: string, keywords: string[]): number {
-  const lower = title.toLowerCase();
-  return keywords.filter((kw) => lower.includes(kw.toLowerCase())).length;
-}
-
-async function runSearchQuery(query: string): Promise<string> {
-  const messages: Anthropic.MessageParam[] = [
-    { role: "user", content: `Search for: ${query}` },
-  ];
-  const textParts: string[] = [];
-  let webSearchCount = 0;
-
-  for (;;) {
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      system:
-        "You are a job search assistant. Summarise search results briefly. Extract only: title, url, location, 2-sentence summary. Stop after finding 5 relevant roles. Do not reproduce full job descriptions.",
-      tools: [WEB_SEARCH_TOOL],
-      messages,
-    });
-
-    for (const block of response.content) {
-      if (block.type === "text") textParts.push(block.text);
-      else textParts.push(`[${block.type}] ${JSON.stringify(block).slice(0, 400)}`);
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const searchUses = response.content.filter(
-      (b): b is Anthropic.ToolUseBlock =>
-        b.type === "tool_use" && (b as any).name === "web_search"
-    );
-    webSearchCount += searchUses.length;
-
-    if (response.stop_reason !== "tool_use" || webSearchCount >= 2) break;
-
-    messages.push({ role: "assistant", content: response.content });
-    messages.push({
-      role: "user",
-      content: searchUses.map((tu) => ({
-        type: "tool_result" as const,
-        tool_use_id: tu.id,
-        content: "",
-      })),
-    });
-  }
-
-  return textParts.join("\n---\n");
-}
-
-async function searchRolesForCompany(
-  company: Company,
-  keywords: string[],
-  emit: (e: AgentSSEEvent) => void
-): Promise<RawRole[]> {
-  const ninetyDaysAgo = new Date();
-  ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-  const dateFilter = ninetyDaysAgo.toISOString().split("T")[0];
-  const query = `site:${company.domain} ${keywords.join(" OR ")} India OR remote after:${dateFilter}`;
-  emit({ type: "agent:search", company: company.name, query });
-
-  const rawText = await runSearchQuery(query);
-
-  emit({
-    type: "agent:debug",
-    company: company.name,
-    message: `RAW: ${rawText || "(empty — no content blocks returned)"}`,
-  });
-
-  if (!rawText.trim()) {
-    emit({
-      type: "agent:debug",
-      company: company.name,
-      message: "Search returned no content — company may be blocking scrapers",
-    });
-    return [];
-  }
-
-  let roles: RawRole[] = [];
-  try {
-    const extractResponse = await anthropic.messages.create({
-      model: "claude-haiku-4-5",
-      max_tokens: 800,
-      system: `Extract EVERY job listing mentioned in the text. Do not skip any.
-Return ONLY a JSON array — no prose, no explanation.
-Format: [{"title":"...","url":"...","snippet":"..."}]
-Use "" for any missing fields. Return [] only if no job listings exist at all.
-Include all roles found, even if you are unsure about the posting date.`,
-      messages: [
-        {
-          role: "user",
-          content: `Extract all job listings from this text:\n\n${rawText.slice(0, 4000)}`,
-        },
-      ],
-    });
-
-    const extractText = extractResponse.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-
-    roles = extractJsonArray(extractText);
-  } catch (err) {
-    emit({
-      type: "agent:debug",
-      company: company.name,
-      message: `Extraction failed: ${err instanceof Error ? err.message : String(err)}`,
-    });
-  }
-
-  const allRoles: RawRole[] = [];
-  const seenTitles = new Set<string>();
-  for (const role of roles) {
-    const key = role.title.toLowerCase().trim();
-    if (!key || seenTitles.has(key)) continue;
-    if (isAggregatorTitle(key)) continue;
-    seenTitles.add(key);
-    allRoles.push(role);
-  }
-
-  if (allRoles.length === 0) {
-    emit({
-      type: "agent:debug",
-      company: company.name,
-      message: "0 roles extracted — no matching roles found in search results",
-    });
-  }
-
-  return allRoles;
-}
-
-async function enrichJD(company: Company, role: RawRole): Promise<string> {
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 1024,
-    system:
-      "You are a job research assistant. Search for detailed job description information. Return a thorough summary of the role's responsibilities, requirements, and team context.",
-    tools: [WEB_SEARCH_TOOL],
-    messages: [
-      {
-        role: "user",
-        content: `Find the full job description for "${role.title}" at ${company.name} (${company.domain}).
-Search specifically for responsibilities, requirements, and what the team works on.
-Return a detailed summary (not JSON — just descriptive text).`,
-      },
-    ],
-  });
-
-  const text = response.content
-    .filter((b): b is Anthropic.TextBlock => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
-
-  return text || role.snippet;
+interface UsageTotal {
+  input: number;
+  output: number;
 }
 
 async function scoreRole(
-  role: RawRole,
-  jdText: string,
-  companyContext: string,
-  profile: string
+  job: NormalizedJob,
+  profile: string,
+  usage: UsageTotal
 ): Promise<RoleScore> {
-  const response = await anthropic.messages.create({
+  const response = await getClient().messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 1024,
     system: buildScoringSystemPrompt(profile),
@@ -262,10 +89,13 @@ async function scoreRole(
     messages: [
       {
         role: "user",
-        content: buildScoringUserPrompt(role.title, jdText, companyContext),
+        content: buildScoringUserPrompt(job.title, job.jdText, ""),
       },
     ],
   });
+
+  usage.input += response.usage.input_tokens;
+  usage.output += response.usage.output_tokens;
 
   const toolUse = response.content.find(
     (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
@@ -274,114 +104,182 @@ async function scoreRole(
   return toolUse.input as RoleScore;
 }
 
+async function fetchJobsForCompany(
+  company: Company,
+  keywords: string[],
+  emit: (e: AgentSSEEvent) => void
+): Promise<{ jobs: NormalizedJob[]; firecrawlCredits: number; haikuUsage: UsageTotal }> {
+  const { type } = company.source;
+  const haikuUsage: UsageTotal = { input: 0, output: 0 };
+
+  if (type === "firecrawl") {
+    const result = await discoverFirecrawlJobs(company, keywords, emit);
+    haikuUsage.input += result.haikuUsage.input;
+    haikuUsage.output += result.haikuUsage.output;
+    return {
+      jobs: result.jobs,
+      firecrawlCredits: result.mapOrSearchCredits + result.scrapesUsed,
+      haikuUsage,
+    };
+  }
+
+  const slug = company.source.slug?.trim();
+  if (!slug) {
+    emit({
+      type: "agent:debug",
+      company: company.name,
+      message: `Source type "${type}" configured with no slug — skipping fetch. Use "Detect source" or set a slug manually.`,
+    });
+    return { jobs: [], firecrawlCredits: 0, haikuUsage };
+  }
+
+  emit({ type: "agent:fetching", company: company.name, source: type, detail: `${type}:${slug}` });
+
+  const fetcher = type === "greenhouse" ? fetchGreenhouseJobs : type === "lever" ? fetchLeverJobs : fetchAshbyJobs;
+  const jobs = await fetcher(slug);
+
+  if (jobs === null) {
+    emit({
+      type: "agent:debug",
+      company: company.name,
+      message: `${type} returned no jobs for slug "${slug}" — check the slug or try "Detect source" again.`,
+    });
+    return { jobs: [], firecrawlCredits: 0, haikuUsage };
+  }
+
+  const withCompanyName = jobs.map((job) => ({ ...job, company: company.name }));
+  return { jobs: withCompanyName, firecrawlCredits: 0, haikuUsage };
+}
+
 async function runForCompany(
   company: Company,
   keywords: string[],
   profile: string,
+  seenIds: Set<string>,
   emit: (e: AgentSSEEvent) => void
-): Promise<QualifyingRole[]> {
+): Promise<{ roles: QualifyingRole[]; funnel: FunnelStats; firecrawlCredits: number; haikuUsage: UsageTotal; scoredJobIds: string[] }> {
   emit({ type: "agent:start", company: company.name });
 
-  let rawRoles: RawRole[] = [];
-  try {
-    rawRoles = await searchRolesForCompany(company, keywords, emit);
-  } catch (err) {
-    console.error(`Search failed for ${company.name}:`, err);
-  }
+  const haikuUsage: UsageTotal = { input: 0, output: 0 };
+  const scoredJobIds: string[] = [];
 
-  emit({
-    type: "agent:roles_found",
-    company: company.name,
-    count: rawRoles.length,
-  });
+  const { jobs: fetched, firecrawlCredits, haikuUsage: fetchUsage } = await fetchJobsForCompany(company, keywords, emit);
+  haikuUsage.input += fetchUsage.input;
+  haikuUsage.output += fetchUsage.output;
 
-  // Sort by keyword relevance (stable sort preserves insertion order for ties)
-  const sorted = [...rawRoles].sort(
+  emit({ type: "agent:fetched", company: company.name, count: fetched.length });
+
+  const afterDate = filterByFreshness(fetched);
+  emit({ type: "agent:filter_progress", company: company.name, stage: "date", before: fetched.length, after: afterDate.length });
+
+  const afterLocation = filterByLocation(afterDate);
+  emit({ type: "agent:filter_progress", company: company.name, stage: "location", before: afterDate.length, after: afterLocation.length });
+
+  const afterSeen = filterSeen(afterLocation, seenIds);
+  emit({ type: "agent:filter_progress", company: company.name, stage: "seen", before: afterLocation.length, after: afterSeen.length });
+
+  const afterTriage = await triageTitles(afterSeen, keywords, profile, emit, haikuUsage);
+  emit({ type: "agent:filter_progress", company: company.name, stage: "triage", before: afterSeen.length, after: afterTriage.length });
+
+  const sorted = [...afterTriage].sort(
     (a, b) => keywordRelevanceScore(b.title, keywords) - keywordRelevanceScore(a.title, keywords)
   );
+  const toScore = sorted.slice(0, TOP_N_TO_SCORE);
 
-  if (rawRoles.length > 5) {
-    emit({ type: "agent:roles_capped", company: company.name, total: rawRoles.length, scoring: 5 });
-  }
-
-  const rolesToScore = sorted.slice(0, 5);
   const qualifyingRoles: QualifyingRole[] = [];
+  let scoredCount = 0;
 
-  for (const role of rolesToScore) {
-    let jdText = role.snippet;
-
-    if (isVagueJD(role.snippet)) {
-      emit({ type: "agent:enriching", company: company.name, role_title: role.title });
-      try {
-        jdText = await enrichJD(company, role);
-      } catch {
-        // fall through with original snippet
-      }
-    }
-
-    emit({ type: "agent:scoring", company: company.name, role_title: role.title });
+  for (const job of toScore) {
+    emit({ type: "agent:scoring", company: company.name, role_title: job.title });
 
     let score: RoleScore;
     try {
-      score = await scoreRole(role, jdText, "", profile);
+      score = await scoreRole(job, profile, haikuUsage);
     } catch (err) {
-      console.error(`Scoring failed for ${role.title}:`, err);
+      console.error(`Scoring failed for ${job.title}:`, err);
       continue;
     }
+
+    scoredCount += 1;
+    scoredJobIds.push(job.id);
 
     const skipped = score.overall < 5;
     emit({
       type: "agent:score_result",
       company: company.name,
-      role_title: role.title,
+      role_title: job.title,
       score,
       skipped,
     });
 
     if (skipped) continue;
 
-    const locationMatch = jdText.match(
-      /(?:location|based in|office|remote|hybrid)[:\s]+([A-Za-z ,\-]+?)(?:\n|,|\.|;|$)/i
-    );
-    const location = locationMatch?.[1]?.trim() ?? "See job posting";
-
     qualifyingRoles.push({
       company: company.name,
-      role_title: role.title,
-      role_url: role.url ?? "#",
-      location,
+      role_title: job.title,
+      role_url: job.url,
+      location: job.location || "See job posting",
       score,
-      jd_summary: jdText,
+      jd_summary: job.jdText,
+      postedAt: job.postedAt,
+      dateVerified: job.dateVerified,
+      source: job.source,
     });
   }
 
+  const funnel: FunnelStats = {
+    fetched: fetched.length,
+    afterDate: afterDate.length,
+    afterLocation: afterLocation.length,
+    afterSeen: afterSeen.length,
+    afterTriage: afterTriage.length,
+    scored: scoredCount,
+    shown: qualifyingRoles.length,
+  };
+
+  emit({ type: "agent:company_stats", company: company.name, source: company.source.type, funnel });
   emit({ type: "agent:done", company: company.name });
-  return qualifyingRoles;
+
+  return { roles: qualifyingRoles, funnel, firecrawlCredits, haikuUsage, scoredJobIds };
 }
 
-export async function GET(request: NextRequest): Promise<Response> {
-  const url = new URL(request.url);
-  const companiesParam = url.searchParams.get("companies");
-  const keywordsParam = url.searchParams.get("keywords");
-  const profile = url.searchParams.get("profile") ?? "";
+function timeout(ms: number): Promise<never> {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), ms));
+}
 
-  let companies: Company[];
+function emptyFunnel(): FunnelStats {
+  return { fetched: 0, afterDate: 0, afterLocation: 0, afterSeen: 0, afterTriage: 0, scored: 0, shown: 0 };
+}
+
+function sumFunnels(a: FunnelStats, b: FunnelStats): FunnelStats {
+  return {
+    fetched: a.fetched + b.fetched,
+    afterDate: a.afterDate + b.afterDate,
+    afterLocation: a.afterLocation + b.afterLocation,
+    afterSeen: a.afterSeen + b.afterSeen,
+    afterTriage: a.afterTriage + b.afterTriage,
+    scored: a.scored + b.scored,
+    shown: a.shown + b.shown,
+  };
+}
+
+export async function POST(request: NextRequest): Promise<Response> {
+  let body: { companies?: unknown; keywords?: unknown; profile?: unknown; seenJobIds?: unknown };
   try {
-    const parsed = companiesParam ? JSON.parse(companiesParam) : null;
-    companies =
-      Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_COMPANIES;
+    body = await request.json();
   } catch {
-    companies = DEFAULT_COMPANIES;
+    body = {};
   }
 
-  let keywords: string[];
-  try {
-    const parsed = keywordsParam ? JSON.parse(keywordsParam) : null;
-    keywords =
-      Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_KEYWORDS;
-  } catch {
-    keywords = DEFAULT_KEYWORDS;
-  }
+  const companies: Company[] =
+    Array.isArray(body.companies) && body.companies.length > 0 ? (body.companies as Company[]) : DEFAULT_COMPANIES;
+
+  const keywords: string[] =
+    Array.isArray(body.keywords) && body.keywords.length > 0 ? (body.keywords as string[]) : DEFAULT_KEYWORDS;
+
+  const profile = typeof body.profile === "string" ? body.profile : "";
+
+  const seenIds = new Set<string>(Array.isArray(body.seenJobIds) ? (body.seenJobIds as string[]) : []);
 
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
@@ -406,9 +304,29 @@ export async function GET(request: NextRequest): Promise<Response> {
 
     try {
       const results = await Promise.all(
-        companies.map((c) => runForCompany(c, keywords, profile, emit))
+        companies.map(async (company) => {
+          try {
+            return await Promise.race([
+              runForCompany(company, keywords, profile, seenIds, emit),
+              timeout(COMPANY_TIMEOUT_MS),
+            ]);
+          } catch {
+            emit({ type: "agent:company_timeout", company: company.name, message: `${company.name} timed out after ${COMPANY_TIMEOUT_MS / 1000}s` });
+            return { roles: [] as QualifyingRole[], funnel: emptyFunnel(), firecrawlCredits: 0, haikuUsage: { input: 0, output: 0 }, scoredJobIds: [] as string[] };
+          }
+        })
       );
-      const allRoles = results.flat();
+
+      const allRoles = results.flatMap((r) => r.roles);
+      const totalFunnel = results.reduce((acc, r) => sumFunnels(acc, r.funnel), emptyFunnel());
+      const estimatedFirecrawlCredits = results.reduce((acc, r) => acc + r.firecrawlCredits, 0);
+      const haikuTokens = results.reduce(
+        (acc, r) => ({ input: acc.input + r.haikuUsage.input, output: acc.output + r.haikuUsage.output }),
+        { input: 0, output: 0 }
+      );
+      const scoredJobIds = results.flatMap((r) => r.scoredJobIds);
+
+      emit({ type: "run:stats", totalFunnel, estimatedFirecrawlCredits, haikuTokens, scored_job_ids: scoredJobIds });
       emit({ type: "run:complete", qualifying_roles: allRoles });
     } catch (err) {
       emit({ type: "run:error", message: String(err) });

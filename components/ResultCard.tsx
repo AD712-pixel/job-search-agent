@@ -34,6 +34,20 @@ const PERSONA_PLACEHOLDERS: Record<Persona, string> = {
   hot: "What's your relationship? (e.g. ex-colleague, former manager, classmate)",
 };
 
+const SOURCE_LABELS: Record<string, string> = {
+  greenhouse: "Greenhouse",
+  lever: "Lever",
+  ashby: "Ashby",
+  firecrawl: "Firecrawl",
+};
+
+function formatPostedDate(postedAt: string | null): string {
+  if (!postedAt) return "Date unknown";
+  const parsed = new Date(postedAt);
+  if (Number.isNaN(parsed.getTime())) return "Date unknown";
+  return parsed.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
+
 export default function ResultCard({ role, profile }: Props) {
   const [persona, setPersona] = useState<Persona | null>(null);
   const [context, setContext] = useState("");
@@ -108,6 +122,17 @@ export default function ResultCard({ role, profile }: Props) {
             <p className="text-xs text-amber-500/70 mt-1">
               Verify role is still open before reaching out
             </p>
+            <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+              <span className="text-xs px-1.5 py-0.5 bg-slate-800 border border-slate-700 rounded text-slate-400">
+                {SOURCE_LABELS[role.source] ?? role.source}
+              </span>
+              <span className="text-xs text-slate-500">{formatPostedDate(role.postedAt)}</span>
+              {!role.dateVerified && (
+                <span className="text-xs px-1.5 py-0.5 bg-amber-950 border border-amber-800 rounded text-amber-400">
+                  date unverified
+                </span>
+              )}
+            </div>
           </div>
           <div className={`text-4xl font-bold shrink-0 ${overallColor}`}>
             {role.score.overall}

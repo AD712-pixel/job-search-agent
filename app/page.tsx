@@ -4,6 +4,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import type { Company, QualifyingRole, AgentSSEEvent } from "@/lib/types";
 import type { UserProfile } from "@/lib/candidate-profile";
 import { buildProfileString } from "@/lib/candidate-profile";
+import { migrateCompanies } from "@/lib/company-source";
 import CompanyConfig from "@/components/CompanyConfig";
 import RunButton from "@/components/RunButton";
 import StreamLog, { type LogEntry } from "@/components/StreamLog";
@@ -14,13 +15,14 @@ import ProfileForm from "@/components/ProfileForm";
 const LS_PROFILE = "job-agent-profile";
 const LS_COMPANIES = "job-agent-companies";
 const LS_KEYWORDS = "job-agent-keywords";
+const LS_SEEN_JOBS = "seenJobs";
 
 // ── Defaults ───────────────────────────────────────────────────────────────────
 const DEFAULT_COMPANIES: Company[] = [
-  { id: "1", name: "Salesforce", domain: "salesforce.com" },
-  { id: "2", name: "Microsoft", domain: "microsoft.com" },
-  { id: "3", name: "Adobe", domain: "adobe.com" },
-  { id: "4", name: "Intuit", domain: "intuit.com" },
+  { id: "1", name: "Salesforce", domain: "salesforce.com", source: { type: "firecrawl", careersUrl: "" } },
+  { id: "2", name: "Microsoft", domain: "microsoft.com", source: { type: "firecrawl", careersUrl: "" } },
+  { id: "3", name: "Adobe", domain: "adobe.com", source: { type: "firecrawl", careersUrl: "" } },
+  { id: "4", name: "Intuit", domain: "intuit.com", source: { type: "firecrawl", careersUrl: "" } },
 ];
 
 const DEFAULT_KEYWORDS = [
@@ -37,25 +39,23 @@ function toLogEntry(event: AgentSSEEvent): LogEntry | null {
 
   switch (event.type) {
     case "agent:start":
-      return { id, level: "info", company: event.company, message: "Starting search..." };
-    case "agent:search":
-      return { id, level: "info", company: event.company, message: `Searching: "${event.query}"` };
-    case "agent:roles_found":
+      return { id, level: "info", company: event.company, message: "Starting..." };
+    case "agent:fetching":
+      return { id, level: "info", company: event.company, message: `[${event.source}] ${event.detail}` };
+    case "agent:fetched":
       return {
         id,
         level: event.count > 0 ? "success" : "skip",
         company: event.company,
-        message: `Found ${event.count} relevant role${event.count !== 1 ? "s" : ""}`,
+        message: `Fetched ${event.count} job${event.count !== 1 ? "s" : ""}`,
       };
-    case "agent:roles_capped":
+    case "agent:filter_progress":
       return {
         id,
-        level: "warn",
+        level: "info",
         company: event.company,
-        message: `Found ${event.total} roles — scoring top ${event.scoring} by title relevance`,
+        message: `${event.stage} filter: ${event.before} → ${event.after}`,
       };
-    case "agent:enriching":
-      return { id, level: "info", company: event.company, message: `Enriching JD: ${event.role_title}` };
     case "agent:scoring":
       return { id, level: "info", company: event.company, message: `Scoring: ${event.role_title}` };
     case "agent:score_result":
@@ -65,10 +65,25 @@ function toLogEntry(event: AgentSSEEvent): LogEntry | null {
         company: event.company,
         message: `— ${event.role_title}: S:${event.score.skills_match} Sen:${event.score.seniority_fit} C:${event.score.context_overlap} Overall:${event.score.overall}/10 — ${event.score.rationale} → ${event.skipped ? "SKIPPED" : "QUALIFYING"}`,
       };
+    case "agent:company_stats":
+      return {
+        id,
+        level: "info",
+        company: event.company,
+        message: `${event.company}: fetched ${event.funnel.fetched} → ${event.funnel.afterDate} → ${event.funnel.afterLocation} → ${event.funnel.afterSeen} → ${event.funnel.afterTriage} → ${event.funnel.scored} scored, ${event.funnel.shown} shown`,
+      };
+    case "agent:company_timeout":
+      return { id, level: "warn", company: event.company, message: event.message };
     case "agent:done":
       return { id, level: "success", company: event.company, message: "Done." };
     case "agent:debug":
       return { id, level: "info", company: event.company, message: event.message };
+    case "run:stats":
+      return {
+        id,
+        level: "info",
+        message: `Total: fetched ${event.totalFunnel.fetched} → ${event.totalFunnel.scored} scored, ${event.totalFunnel.shown} shown. ~${event.estimatedFirecrawlCredits} Firecrawl credits, ${event.haikuTokens.input + event.haikuTokens.output} Haiku tokens.`,
+      };
     default:
       return null;
   }
@@ -84,12 +99,13 @@ export default function HomePage() {
   const [companies, setCompanies] = useState<Company[]>(DEFAULT_COMPANIES);
   const [keywords, setKeywords] = useState<string[]>(DEFAULT_KEYWORDS);
   const [keywordInput, setKeywordInput] = useState("");
+  const [seenJobs, setSeenJobs] = useState<string[]>([]);
 
   const [isRunning, setIsRunning] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [qualifyingRoles, setQualifyingRoles] = useState<QualifyingRole[]>([]);
   const [hasRun, setHasRun] = useState(false);
-  const esRef = useRef<EventSource | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // ── Load from localStorage on mount ────────────────────────────────────────
   useEffect(() => {
@@ -99,11 +115,15 @@ export default function HomePage() {
     } catch {}
     try {
       const sc = localStorage.getItem(LS_COMPANIES);
-      if (sc) setCompanies(JSON.parse(sc));
+      if (sc) setCompanies(migrateCompanies(JSON.parse(sc)));
     } catch {}
     try {
       const sk = localStorage.getItem(LS_KEYWORDS);
       if (sk) setKeywords(JSON.parse(sk));
+    } catch {}
+    try {
+      const ss = localStorage.getItem(LS_SEEN_JOBS);
+      if (ss) setSeenJobs(JSON.parse(ss));
     } catch {}
     setInitialized(true);
   }, []);
@@ -119,6 +139,12 @@ export default function HomePage() {
     if (!initialized) return;
     localStorage.setItem(LS_KEYWORDS, JSON.stringify(keywords));
   }, [keywords, initialized]);
+
+  // ── Persist seen jobs ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!initialized) return;
+    localStorage.setItem(LS_SEEN_JOBS, JSON.stringify(seenJobs));
+  }, [seenJobs, initialized]);
 
   // ── Profile save ────────────────────────────────────────────────────────────
   const handleSaveProfile = (p: UserProfile) => {
@@ -147,10 +173,18 @@ export default function HomePage() {
     }
   };
 
+  const resetSeenJobs = () => {
+    setSeenJobs([]);
+    setLogEntries((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), level: "warn" as const, message: "Seen jobs list cleared." },
+    ]);
+  };
+
   // ── Agent run ───────────────────────────────────────────────────────────────
   const profileString = profile ? buildProfileString(profile) : "";
 
-  const startRun = useCallback(() => {
+  const startRun = useCallback(async () => {
     if (isRunning) return;
 
     setIsRunning(true);
@@ -158,51 +192,74 @@ export default function HomePage() {
     setQualifyingRoles([]);
     setHasRun(true);
 
-    const params = new URLSearchParams({
-      companies: JSON.stringify(companies),
-      keywords: JSON.stringify(keywords),
-      profile: profileString,
-    });
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-    const es = new EventSource(`/api/agent?${params.toString()}`);
-    esRef.current = es;
+    try {
+      const res = await fetch("/api/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companies, keywords, profile: profileString, seenJobIds: seenJobs }),
+        signal: controller.signal,
+      });
 
-    es.onmessage = (e: MessageEvent<string>) => {
-      const event = JSON.parse(e.data) as AgentSSEEvent;
+      if (!res.body) throw new Error("No response body");
 
-      if (event.type === "run:complete") {
-        setQualifyingRoles(event.qualifying_roles);
-        setIsRunning(false);
-        es.close();
-        return;
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() ?? "";
+
+        for (const chunk of chunks) {
+          const line = chunk.trim();
+          if (!line || line.startsWith(":")) continue; // heartbeat comment
+          if (!line.startsWith("data:")) continue;
+
+          const event = JSON.parse(line.slice(5).trim()) as AgentSSEEvent;
+
+          if (event.type === "run:complete") {
+            setQualifyingRoles(event.qualifying_roles);
+            continue;
+          }
+
+          if (event.type === "run:error") {
+            setLogEntries((prev) => [
+              ...prev,
+              { id: crypto.randomUUID(), level: "warn" as const, message: `Error: ${event.message}` },
+            ]);
+            continue;
+          }
+
+          if (event.type === "run:stats") {
+            setSeenJobs((prev) => Array.from(new Set([...prev, ...event.scored_job_ids])));
+          }
+
+          const entry = toLogEntry(event);
+          if (entry) setLogEntries((prev) => [...prev, entry]);
+        }
       }
-
-      if (event.type === "run:error") {
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
         setLogEntries((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), level: "warn" as const, message: `Error: ${event.message}` },
+          { id: crypto.randomUUID(), level: "warn" as const, message: "Connection closed." },
         ]);
-        setIsRunning(false);
-        es.close();
-        return;
       }
-
-      const entry = toLogEntry(event);
-      if (entry) setLogEntries((prev) => [...prev, entry]);
-    };
-
-    es.onerror = () => {
+    } finally {
       setIsRunning(false);
-      setLogEntries((prev) => [
-        ...prev,
-        { id: crypto.randomUUID(), level: "warn" as const, message: "Connection closed." },
-      ]);
-      es.close();
-    };
-  }, [isRunning, companies, keywords, profileString]);
+      abortRef.current = null;
+    }
+  }, [isRunning, companies, keywords, profileString, seenJobs]);
 
   const stopRun = () => {
-    esRef.current?.close();
+    abortRef.current?.abort();
     setIsRunning(false);
     setLogEntries((prev) => [
       ...prev,
@@ -344,6 +401,14 @@ export default function HomePage() {
                   className="w-full py-1.5 text-xs text-slate-500 hover:text-slate-300 transition-colors"
                 >
                   Stop run
+                </button>
+              )}
+              {!isRunning && seenJobs.length > 0 && (
+                <button
+                  onClick={resetSeenJobs}
+                  className="w-full py-1.5 text-xs text-slate-500 hover:text-slate-300 transition-colors"
+                >
+                  Reset seen jobs ({seenJobs.length})
                 </button>
               )}
             </div>
