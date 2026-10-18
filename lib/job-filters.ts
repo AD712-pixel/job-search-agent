@@ -18,23 +18,36 @@ export function filterByFreshness(jobs: NormalizedJob[]): NormalizedJob[] {
   });
 }
 
-const US_ONLY_MARKERS = [
-  "united states", "usa", "u.s.", "u.s.a",
-  "new york", "san francisco", "seattle", "austin", "chicago", "boston",
-  "los angeles", "denver", "atlanta", "miami", "washington, d.c", "washington dc",
+const BASE_LOCATION_MARKERS = [
+  "india", "remote", "hybrid", "anywhere",
+  "bengaluru", "bangalore", "hyderabad", "pune", "mumbai", "delhi", "ncr",
+  "gurugram", "gurgaon", "noida", "chennai", "kolkata",
 ];
 
-function mentionsIndiaOrRemote(lowerLocation: string): boolean {
-  return lowerLocation.includes("india") || lowerLocation.includes("remote") || lowerLocation.includes("hybrid");
+const LOCATION_STOPWORDS = new Set([
+  "remote", "roles", "role", "open", "opening", "relocate", "relocation",
+  "within", "abroad", "location", "preferences", "preference", "based",
+  "anywhere", "willing", "flexible", "hybrid", "office", "onsite",
+]);
+
+// Extract keywords from the profile's "Location: ..." segment so filtering
+// adapts to whatever the user actually typed, not just a fixed city list.
+function extractProfileLocationKeywords(profile: string): string[] {
+  const match = profile.match(/Location:\s*([\s\S]+)$/i);
+  if (!match) return [];
+  const segment = match[1].replace(/\.\s*$/, "");
+  return segment
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter((w) => w.length >= 4 && !LOCATION_STOPWORDS.has(w));
 }
 
-export function filterByLocation(jobs: NormalizedJob[]): NormalizedJob[] {
+export function filterByLocation(jobs: NormalizedJob[], profile: string): NormalizedJob[] {
+  const markers = Array.from(new Set([...BASE_LOCATION_MARKERS, ...extractProfileLocationKeywords(profile)]));
   return jobs.filter((job) => {
-    const loc = job.location.toLowerCase();
+    const loc = job.location.toLowerCase().trim();
     if (!loc) return true; // ambiguous — keep, scoring's location cap is the real backstop
-    if (mentionsIndiaOrRemote(loc)) return true;
-    const looksUsOnly = US_ONLY_MARKERS.some((marker) => loc.includes(marker));
-    return !looksUsOnly;
+    return markers.some((marker) => loc.includes(marker));
   });
 }
 

@@ -12,8 +12,8 @@ Use the score_role tool to return a structured score. A score of 6 means a reaso
 - overall (1-10): Holistic fit — weight skills_match and seniority_fit most heavily, context_overlap least heavily
 
 Location rule (hard filter, not soft penalty):
-- If the role is explicitly US-only with no remote option and no India office listed, set seniority_fit to a maximum of 3 and overall to a maximum of 4. This is a hard location filter.
-- If the role is India-based or remote-friendly, do not penalize for location at all.`;
+- The candidate's location preference is stated in their profile above. If the job's stated location is a specific place that does not match that preference, and nothing in the listing indicates remote work or an office in the candidate's location is available, set seniority_fit to a maximum of 3 and overall to a maximum of 4. Apply this even if the listing never explicitly rules out remote or the candidate's location — treat silence on an otherwise specific, non-matching location as unavailable, not as ambiguous.
+- If the role's location matches or is compatible with the candidate's stated preference, mentions remote work, or the location is missing/ambiguous, do not penalize for location at all.`;
 }
 
 export function buildScoringUserPrompt(

@@ -172,7 +172,7 @@ async function runForCompany(
   const afterDate = filterByFreshness(fetched);
   emit({ type: "agent:filter_progress", company: company.name, stage: "date", before: fetched.length, after: afterDate.length });
 
-  const afterLocation = filterByLocation(afterDate);
+  const afterLocation = filterByLocation(afterDate, profile);
   emit({ type: "agent:filter_progress", company: company.name, stage: "location", before: afterDate.length, after: afterLocation.length });
 
   const afterSeen = filterSeen(afterLocation, seenIds);
